@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""PreToolUse hook: block irreversible git commands, allow their safe variants.
+
+Reads a Claude Code hook payload on stdin. Exit 2 blocks the tool call and
+sends the stderr message back to the model; exit 0 allows it.
+
+Principle: block the force variant, allow the guarded one. Anything that only
+becomes dangerous once pushed (rebase, commit --amend) stays allowed, because
+force-push itself is blocked.
+
+One rule earns an exception because it can be *proved* harmless rather than
+judged: deleting a remote branch whose every commit is already contained in the
+remote's default branch destroys nothing — the commits live on in the base, and
+the ref is recreatable from it. See `deletion_is_provably_merged`, which proves
+that against the live remote and fails closed on anything it cannot verify.
+"""
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+# Force-push is judged on tokens, not by a regex: a regex cannot tell a bare --force standing
+# beside --force-with-lease from the lease itself, and missed `+main` without a colon.
+FORCE_PUSH = ("force-push overwrites remote history that others may already have",
+              "use --force-with-lease, which refuses if the remote moved")
+PLUS_REFSPEC = ("a leading + in a refspec is a force-push in disguise",
+                "use --force-with-lease, which refuses if the remote moved")
+SEGMENT_SPLIT = re.compile(r"[;&|\n()]")
+# push options whose value is the next word
+PUSH_VALUE_OPTIONS = {"-o", "--push-option", "--repo", "--receive-pack", "--exec"}
+
+# (pattern, what it destroys, what to do instead)
+RULES = [
+    (r"\bgit\b[^;&|]*\bpush\b[^;&|]*(?:\s--delete\b|\s:[A-Za-z0-9_./-]+)",
+     "deleting a remote branch or tag",
+     "ask the operator to delete it, or delete only branches already contained "
+     "in the remote's default branch (that case is allowed automatically when the "
+     "push runs as one plain command — git [-C dir] push <remote> --delete "
+     "<branch>, no cd, &&, ;, pipe or redirect — every named ref qualifies and its "
+     "commit is fetched locally: run git fetch --prune first, as a separate call)"),
+    (r"\bgit\b[^;&|]*\breset\b[^;&|]*\s--hard\b",
+     "reset --hard discards every uncommitted change in the working tree",
+     "use git stash, or git reset without --hard to keep the changes"),
+    (r"\bgit\b[^;&|]*\bclean\b[^;&|]*\s-[A-Za-z]*f",
+     "git clean -f permanently deletes untracked files, including ones never staged",
+     "run git clean -n first and show the operator what would be deleted"),
+    (r"\bgit\b[^;&|]*\b(?:checkout|restore)\b[^;&|]*\s(?:--\s+)?\.(?:\s|$)",
+     "discarding all working-tree changes at once",
+     "restore specific paths instead, so unrelated edits survive"),
+    (r"\bgit\b[^;&|]*\bstash\b[^;&|]*\s(?:drop|clear)\b",
+     "dropping stashed work, which is not recoverable",
+     "use git stash list and git stash pop to inspect it first"),
+    (r"\bgit\b[^;&|]*\bbranch\b[^;&|]*\s-[A-Za-z]*D\b",
+     "branch -D deletes a branch even when it holds unmerged commits",
+     "use git branch -d, which refuses to delete unmerged work — or, if the branch "
+     "was squash-merged, note that the forced form is allowed automatically, as one "
+     "plain command without cd, &&, ;, pipe or redirect, once the default branch "
+     "demonstrably contains every line the branch carries"),
+    (r"\bgit\b[^;&|]*\b(?:filter-branch|filter-repo)\b",
+     "rewriting the entire history of the repository",
+     "do this by hand, outside the agent, with a backup"),
+]
+
+COMPILED = [(re.compile(p), why, alt) for p, why, alt in RULES]
+DELETE_RULE = 0         # index into RULES — remote branch deletion
+BRANCH_DELETE_RULE = 5  # index into RULES — local forced branch deletion
+assert RULES[DELETE_RULE][1].startswith("deleting a remote branch")
+assert RULES[BRANCH_DELETE_RULE][1].startswith("branch -D")
+
+# Commit/tag messages quote arbitrary prose, so "git commit -m 'undo reset --hard'"
+# must not read as a reset. Blank the message argument before matching.
+MESSAGE_ARG = re.compile(r"""(-m|--message)(=|\s+)('[^']*'|"[^"]*"|\S+)""")
+
+# Anything that can compose, redirect or expand defeats single-command parsing, so the
+# deletion exception is never attempted on such a line — it stays blocked.
+SHELL_META = set(";&|<>`$()\n\\\"'")
+# Push options that cannot widen what gets deleted. Everything else (--mirror, --all,
+# --tags, --force…) voids the exception.
+INERT_PUSH_OPTS = {"-q", "--quiet", "--porcelain", "--dry-run", "-n", "--no-verify",
+                   "--verbose", "-v", "--progress", "--no-progress", "--atomic"}
+SAFE_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+# Tokens that only express "delete this branch", forced or not. Anything else after `git branch`
+# selects or lists other refs and voids the exception.
+DELETE_FLAGS = {"-" + "D", "-d", "--delete", "--force", "-f"}
+
+
+def _git(repo, *args, timeout=15):
+    """Run git in `repo`; return stdout on success, None on any failure."""
+    try:
+        p = subprocess.run(("git", "-C", repo) + args, capture_output=True,
+                           text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return p.stdout.strip() if p.returncode == 0 else None
+
+
+SEPARATORS = set(";&|()\n")
+
+
+def _command_words(command: str):
+    """Split a command line into the word lists of its simple commands, the way bash does.
+
+    Quotes and backslashes are honoured, so a separator inside a quoted value (`-o ';'`) does
+    not cut a command in two. `#` starts a comment only at the start of a word, so a ref such
+    as `topic#123` stays whole. An unterminated quote keeps the rest as one word.
+    """
+    words, word, in_word, quote = [], [], False, None
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            else:
+                word.append(ch)
+        elif quote == '"':
+            if ch == '"':
+                quote = None
+            elif ch == "\\" and i + 1 < n and command[i + 1] in '"\\$`\n':
+                i += 1
+                if command[i] != "\n":
+                    word.append(command[i])
+            else:
+                word.append(ch)
+        elif ch == "$" and i + 1 < n and command[i + 1] == "'":  # $'…' is a quote too
+            pass
+        elif ch in "'\"":
+            quote, in_word = ch, True
+        elif ch == "\\" and i + 1 < n:
+            i += 1
+            if command[i] != "\n":  # backslash-newline continues the line
+                word.append(command[i])
+                in_word = True
+        elif ch == "#" and not in_word:
+            while i < n and command[i] != "\n":
+                i += 1
+            continue
+        elif ch in " \t\r" or ch in SEPARATORS:
+            if in_word:
+                words.append("".join(word))
+                word, in_word = [], False
+            if ch in SEPARATORS and words:
+                yield words
+                words = []
+        else:
+            word.append(ch)
+            in_word = True
+        i += 1
+    if in_word:
+        words.append("".join(word))
+    if words:
+        yield words
+
+
+# git's global options that take the next word as their value
+GIT_VALUE_OPTIONS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"}
+
+
+def _git_subcommand(tokens, i):
+    """Index of git's subcommand in tokens, starting after `git`, skipping global options."""
+    while i < len(tokens):
+        t = tokens[i]
+        if t in GIT_VALUE_OPTIONS:
+            i += 2
+        elif t.startswith("-"):
+            i += 1
+        else:
+            return i
+    return None
+
+
+def _push_args(command: str):
+    """Yield the argument tokens of every `git … push` in the command line.
+
+    Quoted words that contain spaces (`bash -c "git push …"`) are searched again, so wrapping
+    a push in a string does not hide it. Unbalanced quotes fall back to plain words.
+    """
+    for tokens in _command_words(command):
+        for i, t in enumerate(tokens):
+            if any(c.isspace() for c in t):  # `bash -c "git push …"`, tabs included
+                yield from _push_args(t)
+            elif os.path.basename(t) == "git":
+                sub = _git_subcommand(tokens, i + 1)
+                if sub is not None and tokens[sub] == "push":
+                    yield tokens[sub + 1:]
+
+
+# The earlier whole-line patterns stay as a second net: the token check misses shapes the
+# patterns catch (`git>/dev/null push …`, quotes broken by message masking), and the patterns
+# miss what the token check catches (`--force` beside a lease, `+ref` without a colon).
+LEGACY_FORCE_PATTERNS = [
+    re.compile(r"\bgit\b[^;&|]*\bpush\b(?=[^;&|]*(?:\s--force\b|\s-f\b))(?![^;&|]*--force-with-lease)"),
+    re.compile(r"\bgit\b[^;&|]*\bpush\b[^;&|]*\s\+[A-Za-z0-9_./-]*:"),
+]
+
+
+def forced_push(command: str):
+    """(why, alt) if any push is forced — bare --force/-f, even beside a lease, or a + refspec."""
+    for args in _push_args(command):
+        takes_value = False
+        for t in args:
+            if takes_value:  # the value of -o/--push-option/--repo/…, not a flag or refspec
+                takes_value = False
+                continue
+            if t in PUSH_VALUE_OPTIONS:
+                takes_value = True
+                continue
+            # -f may sit in a short cluster (-uf); text after -o is its value, not flags
+            short_force = (t.startswith("-") and not t.startswith("--")
+                           and "f" in t[1:].split("o", 1)[0])
+            if t == "--force" or short_force:
+                return FORCE_PUSH
+            if t.startswith("+"):
+                return PLUS_REFSPEC
+    if any(p.search(command) for p in LEGACY_FORCE_PATTERNS):
+        return FORCE_PUSH
+    return None
+
+
+def _parse_push_delete(command: str):
+    """(repo_rel_dirs, remote, [refs]) for a plain `git push` deletion, else None."""
+    if any(ch in command for ch in SHELL_META):
+        return None
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    if not tokens or os.path.basename(tokens[0]) != "git":
+        return None
+
+    dirs, i = [], 1
+    while i < len(tokens) and tokens[i] != "push":
+        t = tokens[i]
+        if t == "-C" and i + 1 < len(tokens):
+            dirs.append(tokens[i + 1]); i += 2
+        elif t.startswith("-C") and len(t) > 2:
+            dirs.append(t[2:]); i += 1
+        elif t == "-c" and i + 1 < len(tokens):
+            i += 2                       # -c key=value: config, not a ref selector
+        else:
+            return None                  # unrecognised global option — no exception
+    if i >= len(tokens):
+        return None
+    i += 1                               # step past "push"
+
+    explicit_delete, positional = False, []
+    for t in tokens[i:]:
+        if t in ("--delete", "-d"):
+            explicit_delete = True
+        elif t in INERT_PUSH_OPTS:
+            continue
+        elif t.startswith("-"):
+            return None
+        else:
+            positional.append(t)
+    if not positional:
+        return None
+
+    remote, rest = positional[0], positional[1:]
+    if not SAFE_REF.match(remote) or "/" in remote or ":" in remote:
+        return None                      # a URL remote has no remote-tracking refs to check
+    if explicit_delete:
+        refs = rest
+    else:                                # `git push origin :branch` refspec form
+        if not rest or not all(r.startswith(":") for r in rest):
+            return None
+        refs = [r[1:] for r in rest]
+
+    cleaned = []
+    for ref in refs:
+        if ref.startswith("refs/tags/") or ref.startswith("refs/remotes/"):
+            return None                  # a tag is not a branch; never auto-allowed
+        cleaned.append(ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref)
+    if not cleaned or not all(SAFE_REF.match(r) for r in cleaned):
+        return None
+    return dirs, remote, cleaned
+
+
+def _default_branch_ref(repo, remote=None):
+    """The ref to prove containment against: the remote's default branch, or the local one."""
+    if remote:
+        base = _git(repo, "symbolic-ref", "-q", "--short", f"refs/remotes/{remote}/HEAD")
+        if base:
+            return base
+        for cand in (f"{remote}/main", f"{remote}/master"):
+            if _git(repo, "rev-parse", "-q", "--verify", cand):
+                return cand
+        return None
+    base = _git(repo, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD")
+    if base:
+        return base
+    for cand in ("origin/main", "origin/master", "main", "master"):
+        if _git(repo, "rev-parse", "-q", "--verify", cand):
+            return cand
+    return None
+
+
+def _absorbed_into(repo, sha, base):
+    """True if merging `sha` into `base` would change nothing — i.e. base already has it all.
+
+    `merge-base --is-ancestor` is the cheap proof and covers fast-forward and merge-commit
+    integration. It does NOT cover a SQUASH merge, which is how most review flows land a branch:
+    the change is in the default branch, byte for byte, but under a new commit that lists the
+    branch nowhere in its ancestry. The branch then looks unmerged forever, and a rule that only
+    knows ancestry blocks every cleanup of a repository that squashes.
+
+    So ask the question the operator actually cares about — can this branch still contribute
+    anything the default branch lacks? — by merging it in memory. An identical tree means no: every
+    line it carries is already there, under whatever commit landed it. A conflict, an unrelated
+    history, or any git failure answers "cannot prove" and stays blocked.
+
+    What this does NOT preserve is the branch's own history: commit messages, authorship and the
+    order of the work. A squash merge has already discarded those, which is why proving the content
+    is the right bar here and not a lowered one.
+    """
+    if _git(repo, "merge-base", "--is-ancestor", sha, base) is not None:
+        return True
+    base_tree = _git(repo, "rev-parse", f"{base}^{{tree}}")
+    if not base_tree:
+        return False
+    merged = _git(repo, "merge-tree", "--write-tree", base, sha)
+    if not merged:
+        return False                     # conflict, unrelated history, or git too old
+    return merged.splitlines()[0].strip() == base_tree
+
+
+def deletion_is_provably_merged(command: str, cwd: str) -> bool:
+    """True only if every named branch is demonstrably contained in the remote's default branch.
+
+    Deliberately strict — every unknown answers "no":
+      * the sha is read from the LIVE remote (`ls-remote`), not from a possibly stale
+        remote-tracking ref, so a branch someone pushed to since the last fetch cannot be
+        deleted on the strength of an old view;
+      * containment is `_absorbed_into` the remote's default branch: ancestry, or for a
+        squash merge an in-memory merge that leaves the base tree unchanged;
+      * the default branch itself, tags, wildcard remotes and unparsable command lines are
+        never eligible.
+    """
+    parsed = _parse_push_delete(command)
+    if not parsed:
+        return False
+    dirs, remote, refs = parsed
+
+    repo = cwd or os.getcwd()
+    for d in dirs:                       # -C is cumulative and may be relative
+        d = os.path.expanduser(d)        # the shell resolves ~ before git sees it
+        repo = d if os.path.isabs(d) else os.path.join(repo, d)
+    if not os.path.isdir(repo):
+        return False
+
+    base = _default_branch_ref(repo, remote)
+    if not base:
+        return False
+    base_branch = base.split("/", 1)[1] if "/" in base else base
+
+    for ref in refs:
+        if ref == base_branch:
+            return False                 # never the default branch itself
+        out = _git(repo, "ls-remote", "--heads", remote, f"refs/heads/{ref}")
+        if not out:
+            return False                 # gone, ambiguous, or the probe failed
+        lines = [l for l in out.splitlines() if l.strip()]
+        if len(lines) != 1:
+            return False
+        sha = lines[0].split()[0]
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            return False
+        if _git(repo, "cat-file", "-e", f"{sha}^{{commit}}") is None:
+            return False                 # not fetched locally — cannot prove anything
+        if not _absorbed_into(repo, sha, base):
+            return False
+    return True
+
+
+def _parse_branch_delete(command: str):
+    """(repo_rel_dirs, [branches]) for a plain forced `git branch` deletion, else None."""
+    if any(ch in command for ch in SHELL_META):
+        return None
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    if not tokens or os.path.basename(tokens[0]) != "git":
+        return None
+
+    dirs, i = [], 1
+    while i < len(tokens) and tokens[i] != "branch":
+        t = tokens[i]
+        if t == "-C" and i + 1 < len(tokens):
+            dirs.append(tokens[i + 1]); i += 2
+        elif t.startswith("-C") and len(t) > 2:
+            dirs.append(t[2:]); i += 1
+        elif t == "-c" and i + 1 < len(tokens):
+            i += 2
+        else:
+            return None
+    if i >= len(tokens):
+        return None
+    i += 1                               # step past "branch"
+
+    names = []
+    for t in tokens[i:]:
+        if t in DELETE_FLAGS:
+            continue                     # the delete intent itself, which is why we are here
+        if t.startswith("-"):
+            return None                  # -r, --remotes, -a, anything else voids the exception
+        names.append(t)
+    if not names or not all(SAFE_REF.match(n) for n in names):
+        return None
+    return dirs, names
+
+
+def _resolve_repo(cwd: str, dirs) -> str:
+    repo = cwd or os.getcwd()
+    for d in dirs:                       # -C is cumulative and may be relative
+        d = os.path.expanduser(d)        # the shell resolves ~ before git sees it
+        repo = d if os.path.isabs(d) else os.path.join(repo, d)
+    return repo
+
+
+def branch_delete_is_provably_absorbed(command: str, cwd: str) -> bool:
+    """True only if every named local branch is fully contained in the default branch.
+
+    Same bar as the remote case, and the same failure mode: every unknown answers "no". The branch
+    must resolve locally, must be neither the default branch nor the checked-out one, and its
+    content must already be in the default branch by ancestry or by `_absorbed_into`.
+    """
+    parsed = _parse_branch_delete(command)
+    if not parsed:
+        return False
+    dirs, names = parsed
+    repo = _resolve_repo(cwd, dirs)
+    if not os.path.isdir(repo):
+        return False
+
+    base = _default_branch_ref(repo)
+    if not base:
+        return False
+    base_short = base.split("/", 1)[1] if "/" in base else base
+    current = _git(repo, "symbolic-ref", "-q", "--short", "HEAD")
+
+    for name in names:
+        if name in (base, base_short) or (current and name == current):
+            return False
+        sha = _git(repo, "rev-parse", "-q", "--verify", "refs/heads/" + name)
+        if not sha or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            return False
+        if not _absorbed_into(repo, sha, base):
+            return False
+    return True
+
+
+def check(command: str, cwd: str = ""):
+    command = MESSAGE_ARG.sub(r"\1\2MSG", command)
+    forced = forced_push(command)
+    if forced:
+        return forced
+    for idx, (pattern, why, alt) in enumerate(COMPILED):
+        if not pattern.search(command):
+            continue
+        if idx == DELETE_RULE and deletion_is_provably_merged(command, cwd):
+            continue                     # proved harmless; other rules still apply
+        if idx == BRANCH_DELETE_RULE and branch_delete_is_provably_absorbed(command, cwd):
+            continue
+        return why, alt
+    return None
+
+
+def main() -> int:
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        return 0  # never break the session on a malformed payload
+    command = (payload.get("tool_input") or {}).get("command") or ""
+    if not command:
+        return 0
+    hit = check(command, payload.get("cwd") or "")
+    if not hit:
+        return 0
+    why, alt = hit
+    print(
+        f"BLOCKED by block-dangerous-git: {why}.\n"
+        f"You do not have authority to run this. Instead: {alt}.\n"
+        f"If the operator truly wants it, they run it themselves.",
+        file=sys.stderr,
+    )
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

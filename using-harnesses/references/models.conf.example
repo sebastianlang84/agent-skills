@@ -1,0 +1,9 @@
+# Copy to ${XDG_CONFIG_HOME:-~/.config}/using-harnesses/models.conf and keep only the lines you change.
+# KEY=value, one per line, no spaces, no quotes. The file is parsed, never sourced; an unknown key, a
+# bad value stops review.py with exit 2. Model availability depends on your provider account.
+# Check the result with: python3 scripts/review.py --print-config  (Windows: python)
+# The first effort in a list is the default; --effort may pick any other listed one.
+CODEX_MODEL=gpt-6.1-sol
+CODEX_EFFORTS=high,medium
+CLAUDE_MODEL=claude-opus-5-5
+CLAUDE_EFFORTS=medium

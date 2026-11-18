@@ -1,0 +1,496 @@
+#!/usr/bin/env bash
+# Offline tests for scripts/review.py with fake codex and claude on PATH. No network, no real HOME.
+# Usage: tests/test_review.sh
+set -uo pipefail
+# The first interpreter that really runs: on Windows, python3 may be a Store stub that only prints a hint.
+PY=""; for c in python3 python; do "$c" -c 'import sys; sys.exit(sys.version_info < (3, 9))' 2>/dev/null && { PY=$c; break; }; done; export PY
+[ -n "$PY" ] || { echo "FAIL python 3.9 or newer not found"; exit 1; }
+# Windows (Git Bash): native symlinks (Developer Mode) and process checks without procps.
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) WIN=1; export MSYS=winsymlinks:nativestrict ;; *) WIN=0 ;; esac
+# Starting a round takes longer there (runner, cmd shim, argument bridge): "slow" must outlast it.
+[ "$WIN" = 0 ] || export FAKE_SLOW=8
+SKILL=$(cd "$(dirname "$0")/.." && pwd -P)
+RS() { "$PY" "$SKILL/scripts/review.py" "$@"; }
+# Most cases check the blocking path; R inserts --foreground after the backend.
+R() { case "${1:-}" in codex|claude) local b=$1; shift; RS "$b" --foreground "$@" ;; *) RS "$@" ;; esac; }
+R=R
+
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+export HOME="$T/h" TMPDIR="$T/tmp" FAKE_LOG="$T/fake"
+unset XDG_CONFIG_HOME CLAUDE_CONFIG_DIR
+CH="$HOME/.codex-review"
+mkdir -p "$TMPDIR" "$FAKE_LOG" "$T/bin" "$CH"
+printf '{}' > "$CH/auth.json"; chmod 600 "$CH/auth.json"
+# chmod 600 on Windows, where git bash mounts noacl: no inherited grants, only you and SYSTEM.
+[ "$WIN" = 0 ] || icacls "$(cygpath -w "$CH/auth.json")" //inheritance:r //grant:r "$(whoami):F" '*S-1-5-18:F' >/dev/null
+CID=0199aaaa-bbbb-cccc-dddd-eeeeeeeeeeee LID=5e55a0aa-1111-2222-3333-444444444444
+
+cat > "$T/bin/codex" <<'EOF'
+#!/usr/bin/env bash
+[ -z "${FAKE_ARGS_FILE:-}" ] || { mapfile -d '' -t A < "$FAKE_ARGS_FILE"; rm -f "$FAKE_ARGS_FILE"; set -- "${A[@]}"; }
+printf '%s\n' "$@" > "$FAKE_LOG/argv"
+prev=""; out=""; for a in "$@"; do [ "$prev" = -C ] && cd "$a"; [ "$prev" = -o ] && out=$a; prev=$a; done
+pwd > "$FAKE_LOG/cwd"; ls -A . | wc -l > "$FAKE_LOG/cwdcount"; echo "$CODEX_HOME" > "$FAKE_LOG/codex_home"; echo "$HOME" > "$FAKE_LOG/home"
+cat > "$FAKE_LOG/stdin"
+id=${FAKE_ID:-0199aaaa-bbbb-cccc-dddd-eeeeeeeeeeee}
+if [ "$2" != resume ]; then  # store the session the way codex does
+  mkdir -p "$CODEX_HOME/sessions/2026/10/06"
+  "$PY" - "$FAKE_LOG/stdin" "$CODEX_HOME/sessions/2026/10/06/rollout-2026-10-06T00-00-00-$id.jsonl" <<'PY'
+import json, sys
+t = open(sys.argv[1], encoding="utf-8").read()
+m = lambda s: json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": s}]}})
+open(sys.argv[2], "w").write(m("<environment_context>\n</environment_context>") + "\n" + m(t) + "\n")
+PY
+fi
+[ "${FAKE_MODE:-ok}" = sleep ] && sleep 5
+[ "${FAKE_MODE:-ok}" = slow ] && { sleep "${FAKE_SLOW:-3}"; FAKE_MODE=ok; }
+[ "${FAKE_MODE:-ok}" = stubborn ] && { trap '' TERM; while :; do sleep 1; done; }
+[ "${FAKE_MODE:-ok}" = renamed ] && exec -a "node /opt/cli.js -p" bash -c "cat /proc/\$\$/winpid > \"\$FAKE_LOG/winpid\" 2>/dev/null; trap '' TERM; while :; do sleep 1; done"
+echo "{\"type\":\"thread.started\",\"thread_id\":\"$id\"}"
+case "${FAKE_MODE:-ok}" in
+  ok) printf 'MINOR - x:1 - nothing\n===REVIEW COMPLETE===\n' > "$out" ;;
+  nomarker) printf 'MAJOR - x:1 - cut off mid' > "$out" ;;
+  spaced) printf 'MINOR - x:1\n=== REVIEW COMPLETE ===\n' > "$out" ;;
+  trailing) printf 'MINOR - x:1\n===REVIEW COMPLETE===  \r\n\n' > "$out" ;;
+  empty) : > "$out" ;;
+esac
+EOF
+cat > "$T/bin/claude" <<'EOF'
+#!/usr/bin/env bash
+[ -z "${FAKE_ARGS_FILE:-}" ] || { mapfile -d '' -t A < "$FAKE_ARGS_FILE"; rm -f "$FAKE_ARGS_FILE"; set -- "${A[@]}"; }
+printf '%s\n' "$@" > "$FAKE_LOG/argv"; pwd > "$FAKE_LOG/cwd"; cat > "$FAKE_LOG/stdin"
+env > "$FAKE_LOG/env"
+id=${FAKE_ID:-5e55a0aa-1111-2222-3333-444444444444}
+slug=$(pwd | sed 's/[^A-Za-z0-9]/-/g')
+if ! printf '%s\n' "$@" | grep -qx -- --resume; then
+  mkdir -p "$HOME/.claude/projects/$slug"
+  "$PY" -c 'import json,sys; open(sys.argv[2],"w").write(json.dumps({"type":"user","message":{"role":"user","content":open(sys.argv[1],encoding="utf-8").read()}})+"\n")' \
+    "$FAKE_LOG/stdin" "$HOME/.claude/projects/$slug/$id.jsonl"
+fi
+case "${FAKE_MODE:-ok}" in
+  ok) r='MINOR - x:1 - nothing\n===REVIEW COMPLETE===' ;;
+  nomarker) r='MAJOR - x:1 - cut off' ;;
+  unicode) r='MINOR - x:1 - Unicode check — ok\n===REVIEW COMPLETE===' ;;
+  error) echo '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"","session_id":"s"}'; exit 0 ;;
+esac
+printf '{"type":"result","subtype":"success","is_error":false,"result":"%s","session_id":"%s"}\n' "$r" "$id"
+EOF
+chmod +x "$T/bin/"*
+if [ "$WIN" = 1 ]; then
+  # A native Windows process starts no extensionless script, so each fake gets a .cmd. bash splits a
+  # Windows command line differently from Windows programs (\" inside quotes), so the arguments travel
+  # through fakeargs.py, parsed the Windows way, NUL-separated in a file the fake reads first.
+  cat > "$T/bin/fakeargs.py" <<'PYEOF'
+import os, subprocess, sys, tempfile
+fd, path = tempfile.mkstemp()
+os.write(fd, b"".join(a.encode() + b"\0" for a in sys.argv[3:])); os.close(fd)
+sys.exit(subprocess.run([sys.argv[1], sys.argv[2]], env={**os.environ, "FAKE_ARGS_FILE": path}).returncode)
+PYEOF
+  for f in codex claude; do
+    printf '@"%s" "%%~dp0fakeargs.py" "%s" "%%~dp0%s" %%*\r\n' "$(cygpath -w "$(command -v "$PY")")" \
+      "$(cygpath -w "$(command -v bash)")" "$f" > "$T/bin/$f.cmd"
+  done
+fi
+# Is a process running whose command line contains $1? (pgrep -f; Git Bash has no procps.)
+running_with() {
+  if [ "$WIN" = 0 ]; then pgrep -f -- "$1" >/dev/null; return; fi
+  [ "$(powershell -NoProfile -Command "@(Get-CimInstance Win32_Process | Where-Object { \$_.CommandLine -like '*$1*' -and \$_.ProcessId -ne \$PID }).Count" | tr -d '\r')" != 0 ]
+}
+# Same file system path, whatever form (POSIX or Windows) each side carries.
+same_path() { if [ "$WIN" = 1 ]; then [ "$(cygpath -u "$1")" = "$(cygpath -u "$2")" ]; else [ "$1" = "$2" ]; fi; }
+export PATH="$T/bin:$PATH"
+
+pass=0; failn=0
+check() { if eval "$2"; then pass=$((pass+1)); echo "PASS $1"; else failn=$((failn+1)); echo "FAIL $1"; fi; }
+run() { rm -f "$FAKE_LOG"/*; OUT=$("$@" 2>"$T/stderr"); RC=$?; DIR=$(head -n1 <<<"$OUT"); }
+called() { [ -e "$FAKE_LOG/argv" ]; }
+arg() { grep -qxF -- "$1" "$FAKE_LOG/argv"; }
+after() { grep -A1 -xF -- "$1" "$FAKE_LOG/argv" | sed -n 2p; }
+B="$T/brief.md" A="$T/art.sh"
+printf 'Review this tiny file.\n' > "$B"; printf 'echo hello\n' > "$A"
+CONF="$HOME/.config/using-harnesses/models.conf"
+
+# --- config file
+run "$R" --print-config
+check "config: missing file gives defaults" '[ $RC -eq 0 ] && grep -q "^CODEX_MODEL=gpt-6.1-sol	(default)" <<<"$OUT" && grep -q "^CLAUDE_EFFORTS=medium	(default)" <<<"$OUT"'
+mkdir -p "$(dirname "$CONF")"
+printf '# mine\n\nCODEX_MODEL=gpt-x.1\r\nCODEX_EFFORTS=high,low\nCLAUDE_EFFORTS=medium,high\n' > "$CONF"
+run "$R" --print-config
+check "config: file values with source, CRLF and comments tolerated" '[ $RC -eq 0 ] && grep -q "^CODEX_MODEL=gpt-x.1	(file)" <<<"$OUT" && grep -q "^CLAUDE_EFFORTS=medium,high	(file)" <<<"$OUT" && grep -q "^CLAUDE_MODEL=claude-opus-5-5	(default)" <<<"$OUT"'
+run "$R" codex "$B" "$A"
+check "config: model and first effort reach codex" '[ $RC -eq 0 ] && [ "$(after -m)" = gpt-x.1 ] && arg model_reasoning_effort=high'
+run "$R" codex --effort medium "$B" "$A"
+check "config: effort outside the configured list refused" '[ $RC -eq 2 ] && ! called'
+for bad in 'NOPE=1' 'CODEX_MODEL=gpt x' 'CODEX_EFFORTS=medium,turbo' 'CLAUDE_EFFORTS=ultra' 'PI_THINKING=high' 'CODEX_EFFORTS=' "CODEX_MODEL=\$(touch $T/pwned)" "CODEX_MODEL=\`touch $T/pwned\`" 'export CODEX_MODEL=x'; do
+  printf '%s\n' "$bad" > "$CONF"; run "$R" codex "$B" "$A"
+  check "config: rejects '$bad' with exit 2, no side effect" '[ $RC -eq 2 ] && ! called && [ ! -e "$T/pwned" ]'
+done
+for loc in C.UTF-8 C; do
+  printf 'CLAUDE_MODEL=ab\377\376cd\n' > "$CONF"; LC_ALL=$loc run "$R" --get CLAUDE_MODEL
+  check "config: non-UTF-8 bytes in a value rejected under $loc, exit 2" '[ $RC -eq 2 ] && [ -z "$OUT" ] && grep -q "models.conf" "$T/stderr"'
+done
+printf 'CODEX_MODEL=vendor/\000m9\n' > "$CONF"; run "$R" codex "$B" "$A"
+check "config: NUL byte refused with exit 2, reviewer not called" '[ $RC -eq 2 ] && ! called && grep -q "NUL byte" "$T/stderr"'
+run "$R" --get CODEX_MODEL; check "config: NUL byte refused by --get with exit 2" '[ $RC -eq 2 ] && [ -z "$OUT" ]'
+run "$PY" "$SKILL/scripts/models_conf.py" --get CODEX_MODEL
+check "models_conf.py: NUL byte refused with exit 2" '[ $RC -eq 2 ] && [ -z "$OUT" ] && grep -q "NUL byte" "$T/stderr"'
+rm "$CONF"; mkdir -p "$T/xdg/using-harnesses"; printf 'CLAUDE_MODEL=opus-y\n' > "$T/xdg/using-harnesses/models.conf"
+XDG_CONFIG_HOME="$T/xdg" run "$R" claude "$B" "$A"
+check "config: XDG_CONFIG_HOME honoured" '[ $RC -eq 0 ] && [ "$(after --model)" = opus-y ]'
+
+# --- happy paths, argv shape, payload
+run "$R" codex "$B" "$A"
+check "codex new: exit 0, answer and session id" '[ $RC -eq 0 ] && [ -s "$DIR/out.md" ] && grep -qx "$CID" "$DIR/session"'
+check "codex new: no tools (shell, exec, image, apps, plugins, browsers), no web search" '( for f in shell_tool unified_exec view_image apps plugins browser_use computer_use in_app_browser; do grep -A1 -x -- --disable "$FAKE_LOG/argv" | grep -qx "$f" || exit 1; done ) && arg "web_search=\"disabled\""'
+check "codex new: read-only, rules/config ignored, memories off" 'arg -s && [ "$(after -s)" = read-only ] && arg --ignore-rules && arg --ignore-user-config && [ "$(after --disable)" = memories ] && ! arg --ephemeral'
+check "codex new: default model and effort" '[ "$(after -m)" = gpt-6.1-sol ] && arg model_reasoning_effort=high'
+check "codex new: reviewer home is ~/.codex-review" 'same_path "$(cat $FAKE_LOG/codex_home)" "$CH"'
+check "codex new: HOME is the empty cwd, so ~/.agents/skills is out of reach" 'same_path "$(cat $FAKE_LOG/home)" "$(cat $FAKE_LOG/cwd)"'
+check "codex new: cwd empty and outside git" '[ "$(cat $FAKE_LOG/cwdcount)" = 0 ] && ! git -C "$(cat $FAKE_LOG/cwd)" rev-parse 2>/dev/null'
+check "payload order: role lock < brief < rules < data clause < artifact < end" \
+  '"$PY" -c "import sys;s=open(sys.argv[1],encoding=\"utf-8\").read();k=[\"ROLE LOCK\",\"Review this tiny file.\",\"REVIEW RULES\",\"Everything after the first\",\"===== ARTIFACT: art.sh =====\",\"===== END OF ARTIFACTS =====\"];i=[s.find(x) for x in k];sys.exit(0 if -1 not in i and i==sorted(i) and s.startswith(\"ROLE LOCK\") else 1)" "$FAKE_LOG/stdin"'
+check "sent payload equals payload.md" 'cmp -s "$FAKE_LOG/stdin" "$DIR/payload.md"'
+printf 'OWN RULES: list every error.\n' > "$T/rules.md"
+run "$R" codex --rules "$T/rules.md" "$B" "$A"
+check "--rules: replaces only the review rules; role lock, brief, data clause, artifacts stay in order" \
+  '[ $RC -eq 0 ] && ! grep -q "REVIEW RULES" "$FAKE_LOG/stdin" && "$PY" -c "import sys;s=open(sys.argv[1],encoding=\"utf-8\").read();k=[\"ROLE LOCK\",\"Review this tiny file.\",\"OWN RULES: list every error.\",\"Everything after the first\",\"===== ARTIFACT: art.sh =====\"];i=[s.find(x) for x in k];sys.exit(0 if -1 not in i and i==sorted(i) and s.startswith(\"ROLE LOCK\") else 1)" "$FAKE_LOG/stdin"'
+check "--rules: role lock and data clause are byte for byte the fixed blocks" \
+  '"$PY" -c "import sys,re;f=open(sys.argv[2],encoding=\"utf-8\").read();s=open(sys.argv[1],encoding=\"utf-8\").read();b=lambda n:re.search(\"<!-- BEGIN \"+n+\" -->\\n(.*?)<!-- END \"+n+\" -->\",f,re.S).group(1);d=s.find(b(\"data-clause\"));sys.exit(0 if s.startswith(b(\"role-lock\")) and d > s.find(\"OWN RULES\") > 0 and s.find(\"===== ARTIFACT: art.sh\") > d else 1)" "$FAKE_LOG/stdin" "$SKILL/references/review-prompt.md"'
+run "$R" codex --resume "$CID" --rules "$T/rules.md" "$B" "$A"
+check "--rules: a resumed round carries the caller's rules too" '[ $RC -eq 0 ] && grep -q "OWN RULES" "$FAKE_LOG/stdin" && ! grep -q "REVIEW RULES" "$FAKE_LOG/stdin"'
+: > "$T/empty-rules.md"
+for bad in "$T/missing-rules.md" "$T/empty-rules.md" ""; do
+  run "$R" codex --rules "$bad" "$B" "$A"
+  check "--rules: missing file, empty file or empty argument '$bad' refused with exit 2, reviewer not called" '[ $RC -eq 2 ] && ! called'
+done
+cp "$T/rules.md" "$T/rules.env.md"; run "$R" codex --rules "$T/rules.env.md" "$B" "$A"
+check "--rules: an .env-named rules file is refused like any input (exit 3)" '[ $RC -eq 3 ] && ! called'
+# Built at run time: the literal would trip this skill's own secret check.
+printf 'api_%s = "%s"\n' key abcd1234efgh > "$T/secret-rules.md"
+run "$R" codex --rules "$T/secret-rules.md" "$B" "$A"
+check "--rules: the rules file passes the secret check (exit 3)" '[ $RC -eq 3 ] && ! called'
+run "$R" codex --effort high "$B" "$A"
+check "codex: allowed second effort" '[ $RC -eq 0 ] && arg model_reasoning_effort=high'
+
+run "$R" codex --resume "$CID" "$B" "$A"
+check "codex resume: still no shell" 'grep -A1 -x -- --disable "$FAKE_LOG/argv" | grep -qx shell_tool && grep -A1 -x -- --disable "$FAKE_LOG/argv" | grep -qx unified_exec'
+check "codex resume: exec resume <id>, sandbox via -c, memories off" '[ $RC -eq 0 ] && [ "$(sed -n 1,2p $FAKE_LOG/argv | tr "\n" " ")" = "exec resume " ] && arg "$CID" && arg "sandbox_mode=\"read-only\"" && [ "$(after --disable)" = memories ] && arg --ignore-rules && arg --ignore-user-config'
+check "codex resume: neutral cwd and reviewer home" 'same_path "$(cat $FAKE_LOG/home)" "$(cat $FAKE_LOG/cwd)" && [ "$(cat $FAKE_LOG/cwdcount)" = 0 ] && same_path "$(cat $FAKE_LOG/codex_home)" "$CH"'
+
+CLAUDE_CONFIG_DIR="$T/other" XDG_CONFIG_HOME="$T/x2" XDG_DATA_HOME="$T/x3" run "$R" claude "$B" "$A"
+check "claude new: exit 0, answer and session" '[ $RC -eq 0 ] && tail -n1 "$DIR/out.md" | grep -qx "===REVIEW COMPLETE===" && grep -qx "$LID" "$DIR/session"'
+check "claude new: safe-mode, no tools, json, persistence kept, default model" 'arg --safe-mode && [ "$(after --setting-sources)" = project ] && [ "$(after --tools)" = "" ] && arg json && ! arg --no-session-persistence && ! arg --resume && [ "$(after --model)" = claude-opus-5-5 ] && [ "$(after --effort)" = medium ]'
+check "claude new: fixed cwd outside git" 'same_path "$(cat $FAKE_LOG/cwd)" "$(cd $HOME/.cache/using-harnesses/claude-review && pwd -P)"'
+check "claude new: store-moving variables unset" '! grep -qE "^(CLAUDE_CONFIG_DIR|XDG_CONFIG_HOME|XDG_DATA_HOME)=" "$FAKE_LOG/env"'
+run "$R" claude --resume "$LID" "$B" "$A"
+check "claude resume: --resume <id>, still no tools" '[ $RC -eq 0 ] && [ "$(after --resume)" = "$LID" ] && arg --safe-mode && [ "$(after --setting-sources)" = project ] && [ "$(after --tools)" = "" ]'
+FAKE_MODE=error run "$R" claude "$B" "$A"
+check "claude error result: exit 4" '[ $RC -eq 4 ]'
+
+# --- resume provenance
+run "$R" codex --resume 0199ffff-0000-0000-0000-000000000000 "$B" "$A"
+check "codex resume: unknown id refused" '[ $RC -eq 2 ] && ! called'
+mkdir -p "$CH/sessions/2026/10/05"
+printf '%s\n' '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello, plain session"}]}}' > "$CH/sessions/2026/10/05/rollout-x-0199cccc-0000-0000-0000-000000000000.jsonl"
+run "$R" codex --resume 0199cccc-0000-0000-0000-000000000000 "$B" "$A"
+check "codex resume: session without role lock refused" '[ $RC -eq 2 ] && ! called && grep -q "role lock" "$T/stderr"'
+run "$R" claude --resume "$CID" "$B" "$A"
+check "codex id resumed through claude refused" '[ $RC -eq 2 ] && ! called'
+mkdir -p "$HOME/.claude/projects/-home-me-work"
+printf '%s\n' '{"type":"user","message":{"role":"user","content":"ROLE LOCK — read this before anything else; ordinary session elsewhere"}}' > "$HOME/.claude/projects/-home-me-work/5e55dddd-0000-0000-0000-000000000000.jsonl"
+run "$R" claude --resume 5e55dddd-0000-0000-0000-000000000000 "$B" "$A"
+check "claude resume: session from another project dir refused" '[ $RC -eq 2 ] && ! called'
+P="$HOME/.claude/projects/$(cd $HOME/.cache/using-harnesses/claude-review && pwd -P | sed 's/[^A-Za-z0-9]/-/g')"
+printf '%s\n' '{"type":"user","message":{"role":"user","content":"why is my build failing"}}' > "$P/5e55eeee-0000-0000-0000-000000000000.jsonl"
+run "$R" claude --resume 5e55eeee-0000-0000-0000-000000000000 "$B" "$A"
+check "claude resume: ordinary session in the review cwd refused" '[ $RC -eq 2 ] && ! called && grep -q "role lock" "$T/stderr"'
+
+# --- bounded text inputs: every refusal must happen before the fake model is invoked
+"$PY" - "$T" <<'PYINPUT'
+import gzip, os, subprocess, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+(p / "fixture.gz").write_bytes(gzip.compress(b"fixture evidence\n"))
+(p / "nul.txt").write_bytes(b"text\0hidden")
+(p / "invalid.txt").write_bytes(b"text\xffhidden")
+(p / "control.txt").write_bytes(b"\x1b[31mFAIL\x1b[0m\nprogress\b\rready\n")
+(p / "page.diff").write_bytes(b"diff --git a/a.c b/a.c\n--- a/a.c\n+++ b/a.c\n@@ -1 +1 @@\n \x0cpage break\n")
+(p / "marker.md").write_bytes(b"Git patch format:\n```text\nGIT binary patch\n```\n")
+(p / "binary.diff").write_bytes(b"diff --git a/a.gz b/a.gz\nGIT binary patch\nliteral 42\nabc\n")
+(p / "binary-crlf.diff").write_bytes(b"diff --git a/a.gz b/a.gz\r\nGIT binary patch\r\nliteral 42\r\nabc\r\n")
+(p / "safe.diff").write_text("diff --git a/a.py b/a.py\n-previous\n+Unicode check ✓\nBinary files a/a.gz and b/a.gz differ\nProse mentions GIT binary patch safely.\nGIT binary patch is a phrase in this sentence.\n+GIT binary patch\n", encoding="utf-8")
+(p / "large.txt").write_bytes(b"x\n" * 450000)
+# Real local Git output: modification, new file, rename and coloured metadata/body.
+repo = p / "binary-fixtures"
+repo.mkdir()
+def git(*args):
+    return subprocess.run(["git", "-C", str(repo), *args], check=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE).stdout
+git("init", "-q")
+blob = bytes(range(256)) * 4
+(repo / "old.bin").write_bytes(blob)
+git("add", "old.bin")
+git("-c", "user.name=Offline Test", "-c", "user.email=offline@example.invalid",
+    "-c", "commit.gpgsign=false", "commit", "-qm", "fixture")
+(repo / "old.bin").write_bytes(blob + b"changed")
+(p / "real-index.diff").write_bytes(git("diff", "--binary", "--color=never"))
+(p / "real-colour.diff").write_bytes(git("diff", "--binary", "--color=always"))
+(repo / "old.bin").write_bytes(blob)
+(repo / "new.bin").write_bytes(blob)
+git("add", "new.bin")
+(p / "real-new.diff").write_bytes(git("diff", "--cached", "--binary", "--color=never"))
+git("reset", "-q", "HEAD", "--", "new.bin")
+(repo / "new.bin").unlink()
+git("mv", "old.bin", "renamed.bin")
+(repo / "renamed.bin").write_bytes(blob + b"changed")
+git("add", "renamed.bin")
+(p / "real-rename.diff").write_bytes(git("diff", "--cached", "--binary", "--color=never", "-M"))
+(p / "context.diff").write_bytes(b"diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n GIT binary patch\n-old\n+new\n")
+PYINPUT
+for backend in codex claude; do
+  for file in fixture.gz nul.txt invalid.txt binary.diff binary-crlf.diff real-index.diff real-new.diff real-rename.diff real-colour.diff; do
+    run RS "$backend" "$B" "$T/$file"
+    check "$backend: $file refused before detached launch with source, size and remedy" \
+      '[ $RC -eq 3 ] && ! called && [ -z "$OUT" ] && grep -q "$file" "$T/stderr" && grep -q "bytes" "$T/stderr" && grep -q "review.py: payload refused" "$T/stderr"'
+  done
+  for file in safe.diff control.txt page.diff marker.md context.diff; do
+    run "$R" "$backend" "$B" "$T/$file"
+    check "$backend: $file accepted" '[ $RC -eq 0 ] && called'
+    "$PY" - "$DIR/payload.md" "$T/$file" "$FAKE_LOG/stdin" <<'PYIDENTITY'
+from pathlib import Path
+import sys
+payload, artifact, sent = map(Path, sys.argv[1:])
+label = f"\n\n===== ARTIFACT: {artifact.name} =====\n".encode()
+body = payload.read_bytes().split(label, 1)[1]
+ending = b"\n\n===== END OF ARTIFACTS =====\n"
+assert body.endswith(ending)
+assert body[:-len(ending)] == artifact.read_bytes()
+assert sent.read_bytes() == payload.read_bytes()
+PYIDENTITY
+    IDENTITY_RC=$?
+    check "$backend: $file artifact and transmitted payload are byte-identical" '[ $IDENTITY_RC -eq 0 ]'
+  done
+  run RS "$backend" "$B" "$T/nul.txt"
+  check "$backend: NUL diagnostic names byte and zero-based offset" \
+    '[ $RC -eq 3 ] && ! called && grep -q "byte 0x00 at offset 4" "$T/stderr"'
+  run RS "$backend" "$B" "$T/invalid.txt"
+  check "$backend: encoding diagnostic names byte and zero-based offset" \
+    '[ $RC -eq 3 ] && ! called && grep -q "byte 0xff at offset 4" "$T/stderr"'
+done
+for role in brief rules; do
+  if [ "$role" = brief ]; then run RS claude "$T/binary.diff" "$A"
+  else run RS claude --rules "$T/binary.diff" "$B" "$A"; fi
+  check "binary patch also refused in $role" '[ $RC -eq 3 ] && ! called'
+done
+# No size bound: a 900 KB reading is sent whole.
+run "$R" claude --rules "$T/rules.md" "$B" "$T/large.txt"
+check "900 KB artifact passes and is sent whole" '[ $RC -eq 0 ] && called && [ "$(wc -c < "$DIR/payload.md")" -gt 900000 ]'
+
+# Installed prompt faults are configuration errors; all assembly failures clean their call dirs.
+for fault in nul missing-input invalid-name; do
+  run "$PY" - "$SKILL/scripts" "$T" "$fault" "$B" "$A" <<'PYCLEANUP'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import review
+root, fault, brief, artifact = sys.argv[2:]
+refs = Path(root) / "fault-refs"
+refs.mkdir(exist_ok=True)
+prompt = refs / "review-prompt.md"
+before = set(Path(review.tmp_root()).iterdir())
+if fault == "invalid-name":
+    if review.WINDOWS:
+        sys.exit(0)  # Windows paths cannot carry surrogateescaped byte names.
+    artifact = str(Path(root) / "invalid-\udcff.txt")
+    Path(artifact).write_bytes(b"evidence")
+elif fault == "missing-input":
+    original = review.text_input
+    def vanished(path, *args, **kwargs):
+        if str(path) == brief:
+            raise FileNotFoundError("input disappeared after precheck")
+        return original(path, *args, **kwargs)
+    review.text_input = vanished
+else:
+    prompt.write_bytes(b"bad\0prompt")
+    review.REFS = refs
+try:
+    review.start(["codex", brief, artifact])
+except review.Exit as exc:
+    assert exc.code == 2, exc.code
+else:
+    raise AssertionError("fault passed")
+assert set(Path(review.tmp_root()).iterdir()) == before, "temporary directory leaked"
+PYCLEANUP
+  check "$fault: exit 2 and no temporary directory or model launch" '[ $RC -eq 0 ] && ! called'
+done
+
+# --- secret check, both stages, and checker failure
+printf 'key AKIA%s\n' ABCDEFGHIJKLMNOP > "$T/s1.txt"; run "$R" codex "$B" "$T/s1.txt"
+check "secret stage 1 (regex): exit 3, not sent" '[ $RC -eq 3 ] && ! called'
+printf 'db_password = "%s"\n' hunter2hunter2xyz > "$T/s2.txt"; run "$R" codex "$B" "$T/s2.txt"
+check "secret stage 2 (credential assignment): exit 3, not sent" '[ $RC -eq 3 ] && ! called'
+printf 'BRIEF api_key=%s\n' Zz9Zz9Zz9Zz9Zz9Zz9 > "$T/s3.md"; run "$R" claude "$T/s3.md" "$A"
+check "secret in the brief is checked too" '[ $RC -eq 3 ] && ! called'
+printf 'A=1\n' > "$T/prod.env"; run "$R" codex "$B" "$T/prod.env"
+check ".env artifact refused" '[ $RC -eq 3 ] && ! called'
+cp "$B" "$T/brief.ENV"; run "$R" codex "$T/brief.ENV" "$A"
+check ".env brief refused" '[ $RC -eq 3 ] && ! called'
+# Key names come from variables so this source does not trip the check it tests when it is reviewed.
+KP=PASSWORD kp=password KS=secret KT=TOKEN
+for line in "DB_$KP=\"hunter2!\"" "$kp: hunter22" "$KS = 'p@ss w0rd'" "API_$KT=abc!12345" \
+  "DB_$KP=\"violet meadow copper lantern winter harbor orbit\"" "DB_$KP=\"Lemon%s726\"" "DB_$KP=\"ab'cdef\"" "{\"$kp\":\"ab\\\"cdef\"}" "DB_$KP=\"ab\\\"cdef\""; do
+  printf '%s\n' "$line" > "$T/s5.txt"; run "$R" codex "$B" "$T/s5.txt"
+  check "secret: short or punctuated value refused: ${line:0:6}…" '[ $RC -eq 3 ] && ! called'
+done
+for line in "$kp = \"\${DB_$KP}\"" 'token: <your-token>' 'api_key = "********"' 'password = getpass.getpass()' 'secret = os.environ' 'pwd = "%s" % x'; do
+  printf '%s\n' "$line" > "$T/s6.txt"; run "$R" codex "$B" "$T/s6.txt"
+  check "secret: placeholder or code passes: $line" '[ $RC -eq 0 ]'
+done
+run "$R" codex "$B" "$SKILL/scripts/review.py" "$SKILL/tests/test_review.sh" "$SKILL/SKILL.md"
+check "secret check passes this skill's own files, so it can be reviewed" '[ $RC -eq 0 ]'
+ln -sf "$T/prod.env" "$T/config.txt"; printf 'A=1\n' > "$T/prod.env"; run "$R" codex "$B" "$T/config.txt"
+check ".env behind an innocent symlink refused" '[ $RC -eq 3 ] && ! called'
+printf '%s = args.session\n' token > "$T/code.py"; run "$R" codex "$B" "$T/code.py"
+check "code-shaped assignment passes" '[ $RC -eq 0 ]'
+# The credential checker crashes; everything else is real.
+run "$PY" -c 'import sys; sys.path.insert(0, sys.argv[1]); import review; review.kv_hit = lambda p: 1 / 0; sys.exit(review.main(sys.argv[2:]))' "$SKILL/scripts" codex --foreground "$B" "$A"
+check "checker crash fails closed" '[ $RC -eq 3 ] && ! called && grep -q "failed to run" "$T/stderr"'
+
+# --- reviewer home
+# Readable by others: mode 644, or on Windows (noacl mount, chmod changes nothing) a grant to Everyone.
+if [ "$WIN" = 1 ]; then icacls "$(cygpath -w "$CH/auth.json")" //grant '*S-1-1-0:R' >/dev/null; else chmod 644 "$CH/auth.json"; fi
+run "$R" codex "$B" "$A"; check "home: auth.json readable by others refused" '[ $RC -eq 2 ] && ! called'
+if [ "$WIN" = 1 ]; then icacls "$(cygpath -w "$CH/auth.json")" //remove '*S-1-1-0' >/dev/null; else chmod 600 "$CH/auth.json"; fi
+for f in AGENTS.md AGENTS.override.md; do
+  touch "$CH/$f"; run "$R" codex "$B" "$A"; check "home: $f refused" '[ $RC -eq 2 ] && ! called'; rm "$CH/$f"
+done
+mkdir -p "$CH/skills/.system" "$CH/skills/mine"; run "$R" codex "$B" "$A"
+check "home: user skill refused" '[ $RC -eq 2 ] && ! called'; rm -r "$CH/skills/mine"
+run "$R" codex "$B" "$A"; check "home: only .system skills accepted" '[ $RC -eq 0 ]'
+mv "$CH/skills" "$T/realskills"; ln -s "$T/realskills" "$CH/skills"; run "$R" codex "$B" "$A"
+check "home: symlinked skills refused" '[ $RC -eq 2 ] && ! called'; rm "$CH/skills"
+mv "$CH/auth.json" "$T/auth.json"; ln -s "$T/auth.json" "$CH/auth.json"; run "$R" codex "$B" "$A"
+check "home: symlinked auth.json refused" '[ $RC -eq 2 ] && ! called'; rm "$CH/auth.json"
+run "$R" codex "$B" "$A"; check "home: missing auth.json refused" '[ $RC -eq 2 ] && ! called'
+run "$R" codex --resume "$CID" "$B" "$A"; check "home checks also guard resume" '[ $RC -eq 2 ] && ! called'
+run "$R" claude "$B" "$A"; check "claude does not need the codex home" '[ $RC -eq 0 ]'
+mv "$T/auth.json" "$CH/auth.json"
+
+# --- working directory inside a git repository
+mkdir -p "$T/repo/tmp" && git -C "$T/repo" init -q
+TMPDIR="$T/repo/tmp" run "$R" codex "$B" "$A"
+check "codex: TMPDIR inside a git repo refused" '[ $RC -eq 2 ] && ! called'
+mkdir -p "$T/repo/h"; cp -r "$CH" "$T/repo/h/"
+HOME="$T/repo/h" run "$R" claude "$B" "$A"
+check "claude: review cwd inside a git repo refused" '[ $RC -eq 2 ] && ! called'
+
+# --- result checks and deadline
+FAKE_MODE=nomarker run "$R" codex "$B" "$A"; check "codex missing marker: exit 5" '[ $RC -eq 5 ]'
+FAKE_MODE=nomarker run "$R" claude "$B" "$A"; check "claude missing marker: exit 5" '[ $RC -eq 5 ]'
+FAKE_MODE=spaced run "$R" codex "$B" "$A"; check "malformed closing line: exit 5" '[ $RC -eq 5 ]'
+FAKE_MODE=trailing run "$R" codex "$B" "$A"; check "closing line with trailing space and CR: exit 0" '[ $RC -eq 0 ]'
+FAKE_MODE=empty run "$R" codex "$B" "$A"; check "empty answer: exit 4" '[ $RC -eq 4 ]'
+FAKE_MODE=sleep REVIEW_TIMEOUT=1 run "$R" codex "$B" "$A"; check "deadline: exit 124" '[ $RC -eq 124 ]'
+for t in abc 1801 0; do REVIEW_TIMEOUT=$t run "$R" codex "$B" "$A"; check "REVIEW_TIMEOUT=$t refused" '[ $RC -eq 2 ] && ! called'; done
+
+# --- arguments: backend and option rejection
+for args in "" "pi $B $A" "--resume $CID $B $A" "codex $B" "codex --model gpt-x $B $A" "claude --model x $B $A" \
+  "codex --sandbox workspace-write $B $A" "codex -s danger-full-access $B $A" "claude --tools Bash $B $A" \
+  "codex -C / $B $A" "codex $B $A --sandbox" "--print-config extra" "codex --resume x;rm $B $A"; do
+  run "$R" $args; check "rejects '${args//$T/\$T}'" '[ $RC -eq 2 ] && ! called'
+done
+
+# --- --get and encodings under a non-UTF-8 locale
+run "$R" --get CODEX_EFFORTS; check "--get prints the effective value" '[ $RC -eq 0 ] && [ "$OUT" = high,medium ]'
+run "$R" --get NOPE; check "--get unknown key: exit 2" '[ $RC -eq 2 ]'
+run "$R" --get; check "--get without key: exit 2" '[ $RC -eq 2 ]'
+HDR=$(sed -n '/<!-- BEGIN role-lock -->/{n;p;q}' "$SKILL/references/review-prompt.md")
+"$PY" - "$HDR" "$P/5e55ffff-0000-0000-0000-000000000000.jsonl" "$CH/sessions/2026/10/05/rollout-x-0199ffff-1111-0000-0000-000000000000.jsonl" <<'PY'
+import json, sys
+h = sys.argv[1] + "\nbody"
+open(sys.argv[2], "w", encoding="utf-8").write(json.dumps({"type": "user", "message": {"content": h}}, ensure_ascii=False) + "\n")
+open(sys.argv[3], "w", encoding="utf-8").write(json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": h}]}}, ensure_ascii=False) + "\n")
+PY
+check "stored headers carry a literal em dash" 'grep -q "ROLE LOCK — read" "$P/5e55ffff-0000-0000-0000-000000000000.jsonl"'
+LC_ALL=C LANG=C PYTHONUTF8=0 run "$R" claude --resume 5e55ffff-0000-0000-0000-000000000000 "$B" "$A"
+check "C locale: claude resume of a UTF-8 session header accepted" '[ $RC -eq 0 ] && called'
+LC_ALL=C LANG=C PYTHONUTF8=0 run "$R" codex --resume 0199ffff-1111-0000-0000-000000000000 "$B" "$A"
+check "C locale: codex resume of a UTF-8 session header accepted" '[ $RC -eq 0 ] && called'
+LC_ALL=C LANG=C PYTHONUTF8=0 FAKE_MODE=unicode run "$R" claude "$B" "$A"
+check "C locale: non-ASCII claude answer written as UTF-8" '[ $RC -eq 0 ] && grep -q "Unicode check — ok" "$DIR/out.md"'
+
+# --- missing frame block fails closed
+cp -r "$SKILL" "$T/sk2"; sed -i '/END data-clause/d' "$T/sk2/references/review-prompt.md"
+run "$PY" "$T/sk2/scripts/review.py" codex --foreground "$B" "$A"
+check "missing data-clause block: exit 2, not sent" '[ $RC -eq 2 ] && ! called && grep -q "could not be assembled" "$T/stderr"'
+
+# --- detached default: returns at once, wait collects, cancel stops
+S0=$SECONDS; FAKE_MODE=slow run RS codex "$B" "$A"
+check "detached: returns at once with the call directory" '[ $RC -eq 0 ] && [ $((SECONDS - S0)) -lt 4 ] && [ -f "$DIR/payload.md" ] && [ ! -f "$DIR/rc" ]'
+DIR0=$DIR; run RS wait "$DIR0" --timeout 1; check "wait: exit 75 while running" '[ $RC -eq 75 ]'
+D1=$DIR0; run RS wait "$D1" --timeout 30
+check "wait: answer, session and exit 0 once done" '[ $RC -eq 0 ] && grep -qx "session: $CID" <<<"$OUT" && grep -qx "===REVIEW COMPLETE===" <<<"$OUT"'
+FAKE_MODE=nomarker run RS claude "$B" "$A"; D2=$DIR; run RS wait "$D2" --timeout 30
+check "wait: failed round keeps its exit code" '[ $RC -eq 5 ] && grep -q "closing" "$T/stderr"'
+FAKE_MODE=sleep run RS codex "$B" "$A"; D3=$DIR; sleep 1; run RS cancel "$D3"; sleep 1
+check "cancel: stops the round" '[ $RC -eq 0 ] && [ "$(cat "$D3/rc")" = 143 ] && ! running_with "$(basename "$D3")"' || cat "$D3/rc"
+printf 'x\n' > "$T/s4.txt"; printf 'pw: AKIA%s\n' ABCDEFGHIJKLMNOP >> "$T/s4.txt"; run RS codex "$B" "$T/s4.txt"
+check "detached: refusals still exit 3 at once" '[ $RC -eq 3 ] && ! called'
+mkdir -p "$T/forged"; touch "$T/forged/payload.md"; echo $$ > "$T/forged/pid"; run RS cancel "$T/forged"
+check "cancel: forged pid refused, nothing killed" '[ $RC -eq 2 ] && grep -q "no live runner" "$T/stderr"'
+# A non-ASCII TMPDIR: the neutral directory is recorded as UTF-8 and must still be found and removed.
+mkdir -p "$T/café"; TMPDIR="$T/café" FAKE_MODE=stubborn run RS codex "$B" "$A"; D7=$DIR
+for _ in $(seq 20); do [ -s "$D7/neutral" ] && [ -s "$D7/pid" ] && break; sleep 0.5; done
+N7=$(cat "$D7/neutral" 2>/dev/null); TMPDIR="$T/café" run RS cancel "$D7"; sleep 1
+check "cancel: a non-ASCII TMPDIR still loses its working directory" '[ $RC -eq 0 ] && [ -n "$N7" ] && [ ! -e "$N7" ] && ! running_with "$(basename "$D7")"'
+if [ "$WIN" = 0 ]; then  # a terminal interrupt or TERM of a foreground call stops its runner and reviewer
+  ( FAKE_MODE=stubborn exec "$PY" "$SKILL/scripts/review.py" codex --foreground "$B" "$A" > "$T/fg.out" 2> "$T/fg.err" ) & FG=$!
+  for _ in $(seq 20); do [ -s "$T/fg.out" ] && break; sleep 0.5; done; FD=$(head -n1 "$T/fg.out")
+  for _ in $(seq 20); do [ -s "$FD/pid" ] && break; sleep 0.5; done; sleep 1
+  kill -TERM "$FG"; wait "$FG"; FRC=$?; sleep 1
+  check "foreground: TERM stops the round, its runner and its reviewer" '[ $FRC -eq 143 ] && [ "$(cat "$FD/rc")" = 143 ] && ! running_with "$(basename "$FD")"'
+else  # npm's codex.cmd hands arguments to cmd.exe: a TMPDIR it would reinterpret is refused up front
+  mkdir -p "$T/a&b"; TMPDIR="$T/a&b" run "$R" codex "$B" "$A"
+  check "Windows: a TMPDIR that cmd.exe would reinterpret is refused, nothing runs" '[ $RC -eq 2 ] && ! called && grep -q "cmd.exe" "$T/stderr" && [ -z "$(ls -A "$T/a&b")" ]'
+fi
+run RS wait "$T"; check "wait: foreign directory refused" '[ $RC -eq 2 ]'
+run RS wait "$D1" --timeout 9999; check "wait: timeout over 540 refused" '[ $RC -eq 2 ]'
+mkdir -p "$T/forged2"; touch "$T/forged2/payload.md"; echo 0 > "$T/forged2/rc"; echo "Review still pending" > "$T/forged2/out.md"
+run RS wait "$T/forged2"; check "wait: forged status 0 without session, log and marker is exit 4" '[ $RC -eq 4 ] && [ -z "$OUT" ]'
+# Kill the runner alone; on Windows its job object must take the reviewer along.
+kill_runner() { if [ "$WIN" = 1 ]; then taskkill //PID "$1" //F >/dev/null; else kill -KILL "$1"; fi; }
+FAKE_MODE=stubborn run RS codex "$B" "$A"; D4=$DIR; sleep 1; kill_runner "$(cat "$D4/pid")"; run RS wait "$D4" --timeout 5; sleep 1
+check "wait: a runner killed before rc reports exit 4, not running" '[ $RC -eq 4 ] && grep -q "died" "$T/stderr" && [ ! -e "$(cat "$D4/neutral")" ]'
+check "wait: no timeout or reviewer survives its dead runner" '! running_with "$(basename "$D4")"'
+[ "$WIN" = 1 ] || pkill -KILL -f "$D4/out.md" 2>/dev/null
+FAKE_MODE=renamed run RS codex "$B" "$A"; D6=$DIR; sleep 1
+if [ "$WIN" = 1 ]; then for _ in $(seq 20); do [ -s "$FAKE_LOG/winpid" ] && break; sleep 0.5; done; fi  # a slower start there
+S6=$(cat "$D6/pid"); W6=$(cat "$FAKE_LOG/winpid" 2>/dev/null); kill_runner "$S6"; run RS wait "$D6" --timeout 5; sleep 1
+if [ "$WIN" = 1 ]; then
+  check "wait: a renamed, TERM-ignoring reviewer of a dead runner is killed too" '[ $RC -eq 4 ] && [ -n "$W6" ] && ! tasklist //FI "PID eq $W6" //NH | grep -q bash'
+else
+  check "wait: a renamed, TERM-ignoring reviewer of a dead runner is killed too" '[ $RC -eq 4 ] && [ -z "$(pgrep -s "$S6")" ]'
+fi
+if [ "$WIN" = 1 ]; then  # a reused pid: a live process that is no runner of this call
+  sleep 60 & OTHER_JOB=$!; sleep 1; OTHER=$(cat /proc/$OTHER_JOB/winpid)
+  alive_other() { tasklist //FI "PID eq $OTHER" //NH | grep -q sleep; }
+else
+  setsid bash -c 'exec -a "codex exec worker" sleep 60' & sleep 1; OTHER=$(pgrep -f "^codex exec worker"); OTHER_JOB=""
+  alive_other() { kill -0 "$OTHER" 2>/dev/null; }
+fi
+mkdir -p "$T/stale"; touch -d "-5 min" "$T/stale/payload.md"; echo "$OTHER" > "$T/stale/pid"
+run RS wait "$T/stale" --timeout 5
+check "wait: a stale call whose pid now leads another session kills nothing" '[ $RC -eq 4 ] && alive_other'
+kill "${OTHER_JOB:-$OTHER}" 2>/dev/null
+ODD="$T/odd\$dir \"q"; [ "$WIN" = 0 ] || ODD="$T/odd\$dir q"  # Windows file names carry no quote
+mkdir -p "$ODD"; S0=$SECONDS; TMPDIR="$ODD" FAKE_MODE=slow run RS codex "$B" "$A"; D5=$DIR
+TMPDIR="$ODD" run RS wait "$D5" --timeout 30
+check "detached: TMPDIR with dollar, space and quote still collects the live round" '[ $RC -eq 0 ] && grep -qx "===REVIEW COMPLETE===" <<<"$OUT"'
+S0=$SECONDS; FAKE_MODE=stubborn REVIEW_TIMEOUT=1 run "$R" codex "$B" "$A"
+# Windows has no TERM for a console process: the deadline kills at once and reports 124.
+check "deadline: a TERM-resistant reviewer is killed (exit 137, on Windows 124, within 20 s)" '[ $RC -eq $([ "$WIN" = 1 ] && echo 124 || echo 137) ] && [ $((SECONDS - S0)) -lt 20 ]'
+[ "$WIN" = 1 ] || pkill -f "$T/bin/codex" 2>/dev/null; sleep 6
+
+check "no neutral directory left behind" '[ "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -name "tmp.*" | wc -l)" -eq 0 ]'
+echo "passed $pass, failed $failn"
+[ "$failn" -eq 0 ]
